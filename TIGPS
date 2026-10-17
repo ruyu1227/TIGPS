@@ -1,0 +1,879 @@
+#  =================================================================
+#  2026 資料漫步
+#  資料庫：TIGPS
+#  團隊隊名：
+#  主題名稱：高素養，反而深陷網路沉迷：青少年數位素養與網路沉迷
+#  ------------------------------------------------------------------
+#  本程式碼完整流程：
+#    0.  讀入原始問卷資料，篩出問卷題目欄位
+#    1.  刪除不納入分析的題目／小題
+#    2.  清理無效值（負值、空白、非數字）為NA
+#    3.  定義通用計分函數（平均分數、勾選題計數）
+#    4.  處理反向計分題與S46重新編碼
+#    5.  依題意合併小題，建立各題組的分數欄位
+#    6.  在樣本篩選前，先計算兩個關鍵量表（素養、成癮）的中位數切點
+#    7.  用題組分數取代其原始小題，整理成分析用資料表
+#    8.  合併父母雙方分數（放寬「兩位家長都要答」的限制，增加有效樣本）
+#    9.  篩出全變數完整作答的最終樣本，並依中位數切點做高／低分組
+#    10. 題組（含尚未合併的小題）計算Cohen's d，比較高高組與其他組
+#    11. 將剩餘小題進一步合併成題組分數（題組層級分析用）
+#    12. 重新計算題組層級的Cohen's d
+#    12-1～12-2. 類別變項以卡方檢定＋Cramér's V篩選顯著關聯
+#    13. 篩選效果量 |Cohen's d| > 0.2 的連續變項
+#    14. 以篩選後的變項建立邏輯斯回歸模型，並檢查共線性（VIF）
+#    15. 繪製Cohen's d棒棒糖圖（含六大類顏色、正負向形狀標示）
+#    16. 繪製素養×成癮四象限散佈圖（含各象限人數與百分比標籤）
+#    17. 繪製邏輯斯回歸森林圖（Odds Ratio + 95%CI，左圖右表雙面板拼接）
+#
+#  使用套件：ggplot2（繪圖）、car（VIF共線性檢查）、broom（整理模型係數）、
+#            patchwork（森林圖左右面板拼接），皆於程式中自動偵測並安裝
+#  輸出檔案：cohens_d_lollipop.png、quadrant_scatter.png、forest_plot.png
+#  =================================================================
+
+
+# ==================================================
+# 0. 套件載入
+# 統一在程式最前面載入全部用到的套件，不足則自動安裝：
+#   car（14-1步VIF共線性檢查）、ggplot2（15～17步繪圖）、
+#   broom（17步整理glm模型係數）、patchwork（17步森林圖左右面板拼接）
+# ==================================================
+required_packages <- c("car", "ggplot2", "broom", "patchwork")
+for (pkg in required_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) install.packages(pkg)
+}
+library(car)
+library(ggplot2)
+library(broom)
+library(patchwork)
+
+
+# ==================================================
+# 0-1. 資料讀取
+# 用file.choose()讓使用者自行選取原始CSV檔；
+# 問卷題目欄位統一以「bs」開頭＋題號命名（例如bs23a），以此規則篩出所有題目欄位
+# ==================================================
+raw_data <- read.csv(
+  file.choose(),
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+# 納入全部問卷題目，不包含ID、權重等欄位
+question_vars <- grep("^bs[0-9]", names(raw_data), value = TRUE)
+item_data <- raw_data[, question_vars, drop = FALSE]
+
+
+# ==================================================
+# 1. 刪除指定題目
+# 刪除與本研究主題無關、或因結構特殊（如時間欄位、補習科目矩陣）不適合直接計分的題目
+# ==================================================
+question_number <- as.integer(
+  sub("^bs([0-9]+).*", "\\1", names(item_data))
+)
+
+# 刪除整題及其所有小題
+drop_questions <- c(2, 13, 14, 35, 37, 39, 41, 62, 63, 64)
+drop_vars <- names(item_data)[question_number %in% drop_questions]
+
+drop_vars <- unique(c(
+  drop_vars,
+  grep("^bs59[ab]", names(item_data), value = TRUE),      # S59a、b：包含時、分欄位
+  grep("^bs60[abcd]", names(item_data), value = TRUE),     # S60a～d：包含時、分欄位，保留S60e
+  grep("^bs17[a-g][1-7]$", names(item_data), value = TRUE), # S17a補習科目整題：bs17a1～bs17g7
+  "bs29b",                                                  # S29b
+  "bs20ag", "bs20ah", "bs20bg", "bs20bh"                    # 父母中介的g、h
+))
+
+item_data <- item_data[, setdiff(names(item_data), drop_vars), drop = FALSE]
+
+
+# ==================================================
+# 2. 負值、空白及非數字轉NA
+# 問卷常見的缺失／拒答代碼為負值或空白，統一轉成NA方便後續計分函數判斷完整性
+# ==================================================
+item_data[] <- lapply(item_data, function(z) {
+  z <- suppressWarnings(as.numeric(trimws(as.character(z))))
+  z[!is.finite(z) | z < 0] <- NA_real_
+  z
+})
+
+
+# ==================================================
+# 3. 計分函數
+# get_items()：檢查小題是否落在合理範圍內的整數，不符合者視為缺失
+# mean_score()：要求該題組所有小題都有效才計算平均（避免用部分題目硬湊分數）
+# count_selected()：計算複選題中勾選的項目數，並處理「以上均無」選項的邏輯矛盾
+# ==================================================
+
+# 取出有效範圍內的小題，超出範圍、非整數者設為NA
+get_items <- function(vars, min_value, max_value) {
+  x <- item_data[, vars, drop = FALSE]
+  x[] <- lapply(x, function(z) {
+    z[!is.finite(z) | z < min_value | z > max_value | z != floor(z)] <- NA_real_
+    z
+  })
+  x
+}
+
+# 所有小題皆有效才計算平均
+mean_score <- function(vars, min_value = 1, max_value = 4) {
+  rowMeans(get_items(vars, min_value, max_value), na.rm = FALSE)
+}
+
+# 計算勾選種類數，不計入「以上均無」
+count_selected <- function(vars, none_var) {
+  x <- get_items(c(vars, none_var), 0, 1)
+  count <- rowSums(x[, vars, drop = FALSE] == 1, na.rm = FALSE)
+  count[is.na(x[[none_var]])] <- NA_real_                 # 「以上均無」欄位缺失，整題視為不完整
+  conflict <- which(x[[none_var]] == 1 & count > 0)
+  count[conflict] <- NA_real_                              # 同時勾選具體項目與「以上均無」：矛盾作答
+  count
+}
+
+
+# ==================================================
+# 4. 反向計分與S46重新編碼
+# S23部分小題為反向敘述，需先轉換方向才能與其他小題合併計分；
+# S46原始編碼不利於直覺解讀（1＝否、2＝是），改成0/1並調整方向後更易於後續分析與報告呈現
+# ==================================================
+reverse_23 <- c("bs23d", "bs23e", "bs23f")                 # S23 d、e、f：5－原始分數
+item_data[reverse_23] <- lapply(get_items(reverse_23, 1, 4), function(z) 5 - z)
+
+# S46b：原始1＝否、2＝是 → 改成0＝未更換密碼、1＝有更換密碼
+item_data$bs46b <- get_items("bs46b", 1, 2)[[1]] - 1
+
+# S46c：原始1＝否、2＝是 → 改成1＝朋友不知道密碼、0＝朋友知道密碼
+item_data$bs46c <- 2 - get_items("bs46c", 1, 2)[[1]]
+
+
+# ==================================================
+# 5. 建立指定題組分數
+# 依問卷設計邏輯，將多個小題合併成具意義的單一分數（例如父母主動型／限制型介入、
+# 帳號安全行為、生活事件種類數等），作為後續分析的基本變項
+# ==================================================
+scores <- data.frame(
+  bs23 = mean_score(paste0("bs23", letters[1:9])),                               # S23：d、e、f反向後，九題平均
+  bs20a_active   = mean_score(paste0("bs20a", c("c", "d", "e", "f", "i"))),       # S20a：父親主動型
+  bs20a_restrict = mean_score(paste0("bs20a", c("a", "b", "j", "k", "l"))),       # S20a：父親限制型
+  bs20b_active   = mean_score(paste0("bs20b", c("c", "d", "e", "f", "i"))),       # S20b：母親主動型
+  bs20b_restrict = mean_score(paste0("bs20b", c("a", "b", "j", "k", "l"))),       # S20b：母親限制型
+  bs46a  = get_items("bs46a", 1, 2)[[1]],                                         # S46a：是否使用定位服務，維持1＝否、2＝是
+  bs46bc = mean_score(c("bs46b", "bs46c"), min_value = 0, max_value = 1),         # S46bc：帳號安全行為，兩題平均
+  bs25_abc = mean_score(paste0("bs25", letters[1:3])),                           # S25：拆成五組，各三題平均
+  bs25_def = mean_score(paste0("bs25", letters[4:6])),
+  bs25_ghi = mean_score(paste0("bs25", letters[7:9])),
+  bs25_jkl = mean_score(paste0("bs25", letters[10:12])),
+  bs25_mno = mean_score(paste0("bs25", letters[13:15])),
+  bs29 = mean_score(paste0("bs29", c("a", "c", "d", "e"))),                      # S29：刪除b，只平均a、c、d、e
+  bs8_count  = count_selected(paste0("bs8", letters[1:12]), none_var = "bs8m"),  # S8：生活事件種類數，排除m「以上均無」
+  bs42_count = count_selected(paste0("bs42_", 1:13), none_var = "bs42_14"),      # S42：行為種類數，排除第14項「都沒有」
+  bs48_count = count_selected(paste0("bs48_", 1:7), none_var = "bs48_8"),        # S48：課程種類數，排除第8項「以上均無」
+  lit_mean = mean_score(paste0("bs47", letters[1:9]), min_value = 1, max_value = 5),  # S47：九題全部有效才計算平均（數位素養）
+  pi_mean  = mean_score(paste0("bs28", letters[1:10]), min_value = 1, max_value = 4)  # S28：十題全部有效才計算平均（數位成癮）
+)
+
+
+# ==================================================
+# 6. 計算高高切點
+# 以兩個量表「各自完整作答者」的中位數作為切點，在第8～9步的樣本篩選前先計算，
+# 確保切點不受後續樣本排除與否影響
+# ==================================================
+lit_cut <- median(scores$lit_mean, na.rm = TRUE)
+pi_cut  <- median(scores$pi_mean, na.rm = TRUE)
+
+
+# ==================================================
+# 7. 題組分數取代其原始小題
+# 已在第5步合併成題組分數的小題從資料表中移除，改放入對應的題組分數；
+# 其他未指定處理的題目（尚未合併）全部保留，供後續小題層級分析使用
+# ==================================================
+replaced_vars <- grep(
+  "^bs(8|20|23|25|28|29|42|46|47|48)([^0-9]|$)",
+  names(item_data),
+  value = TRUE
+)
+
+analysis_data <- cbind(
+  item_data[, setdiff(names(item_data), replaced_vars), drop = FALSE],
+  scores
+)
+
+
+# ==================================================
+# 8. 合併父母分數
+# 原始設計要求父母雙方都完整作答才能計分，條件過於嚴格會流失許多樣本；
+# 改為「至少一位家長有效即可計分、兩位都有則取平均」，並印出合併前後的有效樣本比較
+# ==================================================
+parent_vars <- c("bs20a_active", "bs20a_restrict", "bs20b_active", "bs20b_restrict")
+
+combine_parents <- function(father, mother) {
+  score <- rowMeans(cbind(father, mother), na.rm = TRUE)
+  score[is.nan(score)] <- NA_real_                         # 兩位都缺失時，rowMeans會產生NaN，改為NA
+  score
+}
+
+bs20_active   <- combine_parents(analysis_data$bs20a_active,   analysis_data$bs20b_active)
+bs20_restrict <- combine_parents(analysis_data$bs20a_restrict, analysis_data$bs20b_restrict)
+
+# 比較S20合併前後的缺失（分母皆為原始全部受訪者）
+missing_before <- list(
+  主動型 = is.na(analysis_data$bs20a_active) | is.na(analysis_data$bs20b_active),
+  限制型 = is.na(analysis_data$bs20a_restrict) | is.na(analysis_data$bs20b_restrict)
+)
+missing_after <- list(
+  主動型 = is.na(bs20_active),
+  限制型 = is.na(bs20_restrict)
+)
+
+print(data.frame(
+  類型 = c("主動型", "限制型"),
+  原本無法計分人數 = sapply(missing_before, sum),
+  合併後無法計分人數 = sapply(missing_after, sum),
+  合併後缺失百分比 = round(sapply(missing_after, mean) * 100, 2),
+  row.names = NULL
+))
+
+# 四個父母分數改為兩個合併分數
+analysis_data_new <- analysis_data[, setdiff(names(analysis_data), parent_vars), drop = FALSE]
+analysis_data_new$bs20_active   <- bs20_active
+analysis_data_new$bs20_restrict <- bs20_restrict
+
+# 比較全部變數完整的樣本數
+keep_before <- complete.cases(analysis_data)
+keep_after  <- complete.cases(analysis_data_new)
+
+print(data.frame(
+  處理方式 = c("原本父母都需完整", "至少一位家長可計分"),
+  有效人數 = c(sum(keep_before), sum(keep_after)),
+  排除人數 = c(sum(!keep_before), sum(!keep_after)),
+  排除百分比 = round(c(mean(!keep_before), mean(!keep_after)) * 100, 2)
+))
+
+cat("\n有效樣本增加：", sum(keep_after) - sum(keep_before), "人\n")
+
+
+# ==================================================
+# 9. 建立最終樣本及高高分組
+# 取「全部變數皆完整作答」的樣本作為最終分析資料，並依第6步計算的中位數切點
+# （lit_cut、pi_cut，不因樣本篩選而重新計算）標記高高組（高素養且高成癮）
+# ==================================================
+clean_data <- analysis_data_new[keep_after, , drop = FALSE]
+clean_data$source_row <- which(keep_after)                 # 保留原始資料列號，方便核對
+
+clean_data$high_high <- as.integer(
+  clean_data$lit_mean >= lit_cut & clean_data$pi_mean >= pi_cut
+)
+
+# 中位數切點
+print(c(S47平均分數中位數 = lit_cut, S28平均分數中位數 = pi_cut))
+
+# 高高與其他組人數
+print(table(factor(
+  clean_data$high_high,
+  levels = c(0, 1),
+  labels = c("其他組", "高高組")
+)))
+
+# 帳號安全分數分布
+print(table(clean_data$bs46bc))
+
+# 最後保留的全部變數
+names(clean_data)
+
+# 各小題缺失情況
+missing_table <- data.frame(
+  題目代碼 = names(item_data),
+  缺失人數 = colSums(is.na(item_data)),
+  缺失比例 = round(colMeans(is.na(item_data)) * 100, 2),
+  row.names = NULL
+)
+missing_table <- missing_table[order(missing_table$缺失比例, decreasing = TRUE), ]
+
+print(head(missing_table, 30), row.names = FALSE)           # 缺失最多的前30題（比例單位：%）
+View(missing_table)
+
+
+# ==================================================
+# 10. 題組（小題層級）Cohen's d：高高組－其他組
+# 針對尚未整理成題組分數的連續型小題，逐題計算高高組與其他組的效果量（Cohen's d），
+# 作為篩選重要變項的第一輪依據；類別型題目另以卡方檢定比較（見第12-1步）
+# ==================================================
+pending_vars <- grep("^bs(6|7|21|57)([^0-9]|$)", names(clean_data), value = TRUE)
+categorical_vars <- c("bs1", "bs15", "bs16", "bs17", "bs34", "bs36", "bs38", "bs40", "bs46a")
+
+d_vars <- setdiff(
+  names(clean_data),
+  c("high_high", "lit_mean", "pi_mean", "source_row", categorical_vars, pending_vars)
+)
+print(d_vars)
+length(d_vars)
+
+stopifnot(
+  exists("clean_data"),
+  exists("d_vars"),
+  "high_high" %in% names(clean_data)
+)
+
+# 計算Cohen's d的通用函數：對每個變數分別比較高高組(y==1)與其他組(y==0)的平均差異，
+# 以兩組合併標準差（pooled SD）作為標準化分母；任一組人數不足2人則回傳NA
+compute_cohens_d <- function(data, vars, group_var) {
+  do.call(rbind, lapply(vars, function(v) {
+    x <- data[[v]]
+    y <- data[[group_var]]
+    x1 <- x[which(y == 1 & is.finite(x))]
+    x0 <- x[which(y == 0 & is.finite(x))]
+    n1 <- length(x1)
+    n0 <- length(x0)
+    d <- NA_real_
+    if (n1 >= 2 && n0 >= 2) {
+      pooled_sd <- sqrt(((n1 - 1) * var(x1) + (n0 - 1) * var(x0)) / (n1 + n0 - 2))
+      if (is.finite(pooled_sd) && pooled_sd > 0) {
+        d <- (mean(x1) - mean(x0)) / pooled_sd
+      }
+    }
+    data.frame(
+      變數代碼 = v,
+      高高組人數 = n1,
+      其他組人數 = n0,
+      高高組平均 = mean(x1),
+      其他組平均 = mean(x0),
+      cohens_d = d,
+      絕對值d = abs(d)
+    )
+  }))
+}
+
+d_result <- compute_cohens_d(clean_data, d_vars, "high_high")
+d_result <- d_result[order(d_result$絕對值d, decreasing = TRUE, na.last = TRUE), ]
+rownames(d_result) <- NULL
+
+selected_d <- subset(d_result, !is.na(cohens_d) & 絕對值d >= 0.2)   # 初步候選：|d| ≥ 0.2
+View(d_result)
+
+
+# ==================================================
+# 11. 每個題組合成一個平均分數（題組層級）
+# 將第10步尚未合併的小題，依問卷題意分組並反向處理後，各合併成一個題組分數，
+# 讓後續分析以「題組」而非「小題」為單位，避免同一構念下的高度相關小題互相稀釋效果量
+# 備註：
+#   bs6：排除bs6g（知道你的行蹤），a~j剩九題；批評指責(a)、不聞不問(e)、衝突緊張(f)、
+#        處罰不一致(h)、體罰(i)反向後，與其他小題合併
+#   bs7_1／bs7_2：S7拆成「管教恰當程度」與「管教嚴格程度」兩個分數
+#   bs57：拆成認知重評（b、c、e）與表達抑制（a、d、f）兩個分數
+# ==================================================
+mean_groups <- list(
+  bs4  = paste0("bs4", letters[1:3]),
+  bs5  = paste0("bs5", letters[1:6]),
+  bs6  = paste0("bs6", setdiff(letters[1:10], "g")),          # a~j排除g，親子相處情形（計分時將負向題反向）
+  bs7_1 = paste0("bs7_1", letters[1:6]),                      # S7：父母管教恰當程度
+  bs7_2 = paste0("bs7_2", letters[1:6]),                      # S7：父母管教嚴格程度
+  bs9  = paste0("bs9", letters[1:3]),
+  bs10 = paste0("bs10", letters[1:2]),
+  bs11 = paste0("bs11", letters[1:2]),
+  bs12 = paste0("bs12", letters[1:3]),
+  bs18 = paste0("bs18", letters[1:4]),
+  bs19 = paste0("bs19", letters[1:10]),
+  bs22 = paste0("bs22", letters[1:6]),
+  bs24 = paste0("bs24", letters[1:6]),
+  bs26 = paste0("bs26", letters[1:6]),
+  bs27 = paste0("bs27", letters[1:4]),
+  bs43 = paste0("bs43", letters[1:2]),
+  bs44 = paste0("bs44", letters[1:5]),
+  bs45 = paste0("bs45", letters[1:4]),
+  bs53 = paste0("bs53", letters[1:3]),
+  bs54 = paste0("bs54", letters[1:5]),
+  bs55 = paste0("bs55", letters[1:20]),
+  bs56 = paste0("bs56", letters[1:14]),
+  bs57_reappraisal = paste0("bs57", c("b", "c", "e")),        # 認知重評
+  bs57_suppression = paste0("bs57", c("a", "d", "f")),        # 表達抑制
+  bs58 = paste0("bs58", letters[1:5]),
+  bs61 = c("bs61a", "bs61b")
+)
+
+d_data <- clean_data                                        # 使用副本，保留目前clean_data
+
+for (g in names(mean_groups)) {
+  vars <- mean_groups[[g]]
+  if (all(vars %in% names(d_data))) {
+    x <- d_data[, vars, drop = FALSE]
+    if (g == "bs9") {
+      x$bs9b <- 5 - x$bs9b                                  # 學校歸屬感：S9b反向，只在仍保留原始小題時處理
+    }
+    if (g == "bs6") {
+      reverse_6 <- c("bs6a", "bs6e", "bs6f", "bs6h", "bs6i") # 批評指責、不聞不問、衝突緊張、處罰不一致、體罰
+      x[reverse_6] <- lapply(x[reverse_6], function(z) 5 - z)
+    }
+    score <- rowMeans(x, na.rm = FALSE)                      # 小題完整才計算平均
+    d_data <- d_data[, setdiff(names(d_data), vars), drop = FALSE]
+    d_data[[g]] <- score                                     # 刪除小題欄位，換成一個題組分數
+  } else if (!(g %in% names(d_data))) {
+    stop(paste("缺少題組欄位，請檢查：", g))
+  }
+}
+
+
+# ==================================================
+# 12. 題組層級的Cohen's d比較清單
+# 重跑第10步的效果量計算，改以題組層級變項為單位
+# 備註：bs6、bs7_1、bs7_2、bs57已於第11步合併完成，不再是待處理題組；
+#       bs21（a~f）維持原始代碼1~12，六題各自獨立進入d_vars比較
+# ==================================================
+pending_vars <- character(0)                                # 已無待處理題組
+categorical_vars <- c("bs1", "bs15", "bs16", "bs17", "bs34", "bs36", "bs38", "bs40", "bs46a")
+
+d_vars <- setdiff(
+  names(d_data),
+  c("high_high", "lit_mean", "pi_mean", "source_row", categorical_vars, pending_vars)
+)
+
+print(grep("^bs4([^0-9]|$)", names(d_data), value = TRUE))   # 確認S4只剩bs4，沒有bs4a、bs4b、bs4c
+print(grep("^bs(6|7_1|7_2|57)([^0-9]|$)", names(d_data), value = TRUE))  # 確認合併後只剩bs6、bs7_1、bs7_2、bs57_reappraisal、bs57_suppression
+print(grep("^bs21", names(d_data), value = TRUE))             # 確認bs21a~bs21f仍各自獨立存在
+print(d_vars)
+
+d_result <- compute_cohens_d(d_data, d_vars, "high_high")
+d_result <- d_result[order(d_result$絕對值d, decreasing = TRUE, na.last = TRUE), ]
+rownames(d_result) <- NULL
+
+View(d_result)
+
+# ==================================================
+# 12-1. 類別變項：卡方檢定 + Cramér's V
+# Cohen's d僅適用於連續變項，對象為categorical_vars（名目尺度題目）另以卡方檢定
+# 搭配Cramér's V（效果量）評估其與依變項high_high的關聯強度
+# ==================================================
+compute_cramers_v <- function(data, vars, group_var) {
+  do.call(rbind, lapply(vars, function(v) {
+    x <- data[[v]]
+    y <- data[[group_var]]
+    valid <- is.finite(x) & is.finite(y)
+    x <- x[valid]
+    y <- y[valid]
+    
+    tab <- table(x, y)
+    n <- sum(tab)
+    
+    # 類別數太少（例如篩完只剩一個類別）無法檢定
+    if (nrow(tab) < 2 || ncol(tab) < 2 || n < 2) {
+      return(data.frame(
+        變數代碼 = v, 有效人數 = n, 類別數 = nrow(tab),
+        chi_sq = NA_real_, 自由度 = NA_real_, p值 = NA_real_,
+        cramers_v = NA_real_, 期望次數小於5比例 = NA_real_
+      ))
+    }
+    
+    chi <- suppressWarnings(chisq.test(tab, correct = FALSE))
+    expected_low <- mean(chi$expected < 5)                 # 期望次數<5的比例，太高時卡方近似可能不準
+    k <- min(nrow(tab), ncol(tab))
+    v_val <- sqrt(unname(chi$statistic) / (n * (k - 1)))
+    
+    data.frame(
+      變數代碼 = v,
+      有效人數 = n,
+      類別數 = nrow(tab),
+      chi_sq = unname(chi$statistic),
+      自由度 = unname(chi$parameter),
+      p值 = chi$p.value,
+      cramers_v = v_val,
+      期望次數小於5比例 = round(expected_low * 100, 1)
+    )
+  }))
+}
+
+cat_result <- compute_cramers_v(d_data, categorical_vars, "high_high")
+cat_result <- cat_result[order(cat_result$cramers_v, decreasing = TRUE, na.last = TRUE), ]
+rownames(cat_result) <- NULL
+
+print(cat_result, row.names = FALSE)
+View(cat_result)
+
+# 期望次數<5比例偏高（例如>20%）的題目，p值建議改用模擬法重算較保守
+recheck_vars <- cat_result$變數代碼[!is.na(cat_result$期望次數小於5比例) &
+                                  cat_result$期望次數小於5比例 > 20]
+if (length(recheck_vars) > 0) {
+  cat("以下類別變項期望次數偏低，建議以模擬法重新檢定：\n")
+  print(recheck_vars)
+  
+  for (v in recheck_vars) {
+    tab <- table(d_data[[v]], d_data$high_high)
+    sim <- chisq.test(tab, correct = FALSE, simulate.p.value = TRUE, B = 2000)
+    cat_result$p值[cat_result$變數代碼 == v] <- sim$p.value
+  }
+}
+
+# ==================================================
+# 12-2. 篩選門檻：p < .05 且 Cramér's V ≥ 0.1（Cohen小效果量參考值）
+# ==================================================
+selected_cat <- subset(cat_result, !is.na(cramers_v) & p值 < 0.05 & cramers_v >= 0.1)
+
+print(selected_cat[, c("變數代碼", "cramers_v", "p值")], row.names = FALSE)
+cat("\n類別變項中共有", nrow(selected_cat), "個通過篩選\n")
+
+# ==================================================
+# 13. 篩選 |Cohen's d| > 0.2
+# 以Cohen（1988）建議的小效果量門檻（0.2）篩選連續變項，作為後續迴歸模型的候選變數
+# ==================================================
+selected_d <- subset(d_result, !is.na(cohens_d) & abs(cohens_d) > 0.2)
+
+print(selected_d[, c("變數代碼", "cohens_d", "絕對值d")], row.names = FALSE)
+cat("\n共有", nrow(selected_d), "個變數\n")
+View(selected_d)
+
+
+# ==================================================
+# 14. 邏輯斯回歸模型（|Cohen's d| > 0.2的變數 + 通過篩選的類別變數）
+# 以第13步、12-2步篩選出的變項，建立以high_high（是否為高素養高成癮組）為依變項的
+# 邏輯斯回歸模型，評估各變項在控制其他變項後的獨立關聯
+# ==================================================
+model_vars <- c(
+  selected_d$變數代碼,
+  paste0("factor(", selected_cat$變數代碼, ")")
+)
+
+model <- glm(
+  reformulate(model_vars, response = "high_high"),
+  data = d_data,
+  family = binomial(link = "logit"),
+  na.action = na.omit
+)
+
+summary(model)
+AIC(model)
+nobs(model)
+
+# ==================================================
+# 14-1. 共線性檢查：VIF
+# 檢查迴歸模型中各自變項之間是否存在高度共線性，避免估計係數不穩定
+# （套件car已於第0步載入）
+# ==================================================
+vif_result <- vif(model)
+print(vif_result)
+
+# factor變項的VIF會回傳GVIF，用GVIF^(1/(2*Df))跟一般VIF比較門檻一致
+vif_table <- data.frame(
+  變數代碼 = rownames(as.data.frame(vif_result)),
+  VIF換算值 = if (is.matrix(vif_result)) {
+    vif_result[, "GVIF^(1/(2*Df))"]^2         # 換算回可與VIF>5/>10門檻比較的尺度
+  } else {
+    vif_result
+  }
+)
+vif_table <- vif_table[order(vif_table$VIF換算值, decreasing = TRUE), ]
+rownames(vif_table) <- NULL
+
+print(vif_table, row.names = FALSE)
+cat("\nVIF > 5（中度共線性，建議留意）的變數：\n")
+print(subset(vif_table, VIF換算值 > 5))
+
+cat("\nVIF > 10（嚴重共線性，建議處理）的變數：\n")
+print(subset(vif_table, VIF換算值 > 10))
+
+# ==================================================
+# 15. Cohen's d棒棒糖圖（含六大類顏色、正負向形狀、中文標籤）
+# 使用題組層級的d_result（第12步計算結果），只畫 |d| > 0.2 的變數（即selected_d），
+# 以棒棒糖圖直觀呈現各變項與「高素養高成癮組」的關聯方向與強弱
+# 本圖不放標題／副標題（已拿掉，交由報告正文或圖說說明），只保留X/Y軸與圖例
+# （套件ggplot2已於第0步載入）
+# ==================================================
+d_threshold <- 0.2
+
+# ------------------------------------------------
+# 變數代碼 → 中文標籤、所屬類別 對照表
+# 僅列出通過篩選門檻的變數；若日後篩選結果變動、出現新變數，
+# 下方會自動跳出警告提醒補上對照
+# ------------------------------------------------
+var_labels <- data.frame(
+  變數代碼 = c(
+    "bs27", "bs26", "bs24", "bs44", "bs25_mno", "bs22",
+    "bs25_abc", "bs25_ghi", "bs25_jkl", "bs23", "bs56", "bs8_count",
+    "bs60e", "bs20_restrict", "bs57_suppression", "bs55", "bs18"
+  ),
+  中文標籤 = c(
+    "FOMO", "網路社會比較", "社群認可焦慮", "上網動機", "網路逃避現實", "網路因應策略",
+    "網路自我形象認同", "網路多重身份", "網路與現實自我落差", "網路形象管理", "憂鬱症狀", "生活壓力事件數",
+    "睡眠品質", "父母限制型介入", "情緒表達抑制", "情緒與社會技能", "父母未來期望"
+  ),
+  類別 = c(
+    "網路生活經驗", "網路生活經驗", "網路生活經驗", "數位環境與素養", "網路生活經驗", "網路生活經驗",
+    "網路生活經驗", "網路生活經驗", "網路生活經驗", "網路生活經驗", "生活經驗與態度", "個人與家庭",
+    "生活經驗與態度", "網路生活經驗", "生活經驗與態度", "生活經驗與態度", "學校生活與學業"
+  ),
+  stringsAsFactors = FALSE
+)
+
+# ------------------------------------------------
+# 合併對照表，準備繪圖資料
+# ------------------------------------------------
+plot_data <- subset(d_result, !is.na(cohens_d) & abs(cohens_d) > d_threshold)
+plot_data <- merge(plot_data, var_labels, by = "變數代碼", all.x = TRUE)
+
+if (any(is.na(plot_data$中文標籤))) {
+  warning("以下變數尚未填入中文標籤對照表，請補上：",
+          paste(plot_data$變數代碼[is.na(plot_data$中文標籤)], collapse = "、"))
+  plot_data$中文標籤[is.na(plot_data$中文標籤)] <- plot_data$變數代碼[is.na(plot_data$中文標籤)]
+  plot_data$類別[is.na(plot_data$類別)] <- "未分類"
+}
+
+plot_data$方向 <- ifelse(plot_data$cohens_d >= 0, "正向關聯", "負向關聯")
+plot_data$中文標籤 <- factor(
+  plot_data$中文標籤,
+  levels = plot_data$中文標籤[order(plot_data$cohens_d)]
+)
+
+category_colors <- c(
+  "個人與家庭"     = "#3366CC",
+  "網路生活經驗"   = "#D1495B",
+  "數位環境與素養" = "#8470C9",
+  "學校生活與學業" = "#3A9679",
+  "同儕關係"       = "#E8821A",
+  "生活經驗與態度" = "#8C96A8"
+)
+
+n_vars <- nrow(plot_data)
+
+lollipop_plot <- ggplot(
+  plot_data,
+  aes(x = cohens_d, y = 中文標籤, color = 類別)
+) +
+  geom_segment(aes(x = 0, xend = cohens_d, y = 中文標籤, yend = 中文標籤),
+               linewidth = 0.9) +
+  geom_point(aes(shape = 方向), size = 3.2) +
+  geom_text(aes(label = sprintf("%.2f", cohens_d)),
+            hjust = ifelse(plot_data$cohens_d >= 0, -0.35, 1.35),
+            size = 3.3, color = "black") +
+  geom_vline(xintercept = c(-d_threshold, d_threshold),
+             linetype = "dashed", color = "grey50") +
+  geom_vline(xintercept = 0, color = "grey70") +
+  scale_color_manual(values = category_colors, name = "類別") +
+  scale_shape_manual(values = c("正向關聯" = 16, "負向關聯" = 17), name = "方向") +
+  labs(
+    x = "Cohen's d",
+    y = NULL
+  ) +
+  guides(
+    shape = guide_legend(order = 1, override.aes = list(color = "grey30")),
+    color = guide_legend(order = 2, override.aes = list(shape = 16))
+  ) +
+  theme_minimal(base_size = 15) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position = "bottom",
+    legend.box = "vertical",
+    legend.box.just = "left",            # 「方向」「類別」兩行圖例的左邊對齊，不要各自置中
+    legend.justification = "left",       # 整組圖例貼齊繪圖區左邊，而不是整個置中
+    legend.spacing.y = unit(0, "pt"),    # 「方向」與「類別」兩行圖例的間距，數字越小越緊
+    legend.margin = margin(t = 0, b = 0) # 每個圖例自己上下的留白，一起縮小才會真的變緊
+  )
+
+print(lollipop_plot)
+
+ggsave(
+  "cohens_d_lollipop.png",
+  plot = lollipop_plot,
+  width = 11,
+  height = max(5, n_vars * 0.42),
+  dpi = 300
+)
+
+# ==================================================
+# 16. 四象限散佈圖（素養 × 成癮）
+# 以S47（lit_mean，數位素養）× S28（pi_mean，數位成癮）中位數切點分四組，
+# 視覺化呈現兩個量表交織下的樣本分布，並標示各象限人數與佔比
+# 本圖不放標題／副標題（已拿掉，交由報告正文或圖說說明），只保留X/Y軸
+# 註：散點座標已加入少量隨機擾動（jitter），僅為避免同分樣本重疊、方便目視判讀分布密度，
+#     不影響原始分數、切點判斷與象限分組結果
+# （套件ggplot2已於第0步載入）
+# ==================================================
+quadrant_data <- clean_data
+
+quadrant_data$象限 <- with(quadrant_data, factor(
+  ifelse(lit_mean >= lit_cut & pi_mean >= pi_cut, "高成癮，高素養",
+         ifelse(lit_mean >= lit_cut & pi_mean <  pi_cut, "低成癮，高素養",
+                ifelse(lit_mean <  lit_cut & pi_mean >= pi_cut, "高成癮，低素養",
+                       "低成癮，低素養"))),
+  levels = c("高成癮，低素養", "高成癮，高素養", "低成癮，低素養", "低成癮，高素養")
+))
+
+# 散點／圖例用色（四色統一調整為相近淺度，維持視覺一致性）
+quadrant_colors <- c(
+  "高成癮，低素養" = "#DAA468",   # 橘
+  "高成癮，高素養" = "#E68A9A",   # 紅
+  "低成癮，低素養" = "#A3AFCE",   # 灰藍
+  "低成癮，高素養" = "#8FD2BB"    # 綠
+)
+
+# 角落標籤文字專用色：比散點色更深，避免淺色（尤其綠色）在白底上看起來模糊
+label_text_colors <- c(
+  "高成癮，低素養" = "#B8630F",
+  "高成癮，高素養" = "#A62E3D",
+  "低成癮，低素養" = "#5C6B8C",
+  "低成癮，高素養" = "#1F5E48"
+)
+
+# 各象限人數與百分比，放進角落標籤
+quad_summary <- as.data.frame(table(quadrant_data$象限))
+names(quad_summary) <- c("象限", "n")
+quad_summary$pct <- round(quad_summary$n / sum(quad_summary$n) * 100, 1)
+quad_summary$label <- paste0(quad_summary$象限, "\nn=", quad_summary$n,
+                             " (", quad_summary$pct, "%)")
+
+x_range <- range(quadrant_data$lit_mean, na.rm = TRUE)
+y_range <- range(quadrant_data$pi_mean,  na.rm = TRUE)
+
+label_pos <- data.frame(
+  象限 = c("高成癮，低素養", "高成癮，高素養", "低成癮，低素養", "低成癮，高素養"),
+  x = c(x_range[1], x_range[2], x_range[1], x_range[2]),
+  y = c(y_range[2], y_range[2], y_range[1], y_range[1]),
+  hjust = c(0, 1, 0, 1),
+  vjust = c(1, 1, 0, 0)
+)
+label_pos <- merge(label_pos, quad_summary[, c("象限", "label")], by = "象限")
+label_pos$text_color <- label_text_colors[label_pos$象限]
+
+n_total <- sum(!is.na(quadrant_data$lit_mean) & !is.na(quadrant_data$pi_mean))
+
+quadrant_plot <- ggplot(
+  quadrant_data,
+  aes(x = lit_mean, y = pi_mean, color = 象限)
+) +
+  geom_point(alpha = 0.4, size = 1.8,
+             position = position_jitter(width = 0.08, height = 0.08)) +    # jitter僅用於繪圖呈現，詳見上方註
+  geom_vline(xintercept = lit_cut, linetype = "dashed", color = "grey40") +
+  geom_hline(yintercept = pi_cut, linetype = "dashed", color = "grey40") +
+  geom_label(
+    data = label_pos,
+    aes(x = x, y = y, label = label, hjust = hjust, vjust = vjust),
+    color = label_pos$text_color,   # 文字用深色，跟散點色脫鉤，提升可讀性
+    fill = alpha("white", 0.6),     # 白底半透明，0.6＝六成不透明
+    fontface = "bold", size = 5,
+    label.size = 0.3, show.legend = FALSE
+  ) +
+  scale_color_manual(values = quadrant_colors) +
+  labs(
+    x = "數位素養",
+    y = "數位成癮",
+    color = NULL
+  ) +
+  theme_minimal(base_size = 15) +
+  theme(
+    legend.position = "none",
+    panel.grid.minor = element_blank()
+  )
+
+print(quadrant_plot)
+
+# 各象限人數（文字版確認）
+print(quad_summary[, c("象限", "n", "pct")])
+
+ggsave(
+  "quadrant_scatter.png",
+  plot = quadrant_plot,
+  width = 9,
+  height = 7,
+  dpi = 300
+)
+
+# ==================================================
+# 17. 邏輯斯回歸森林圖（Odds Ratio + 95%CI，左圖右表雙面板拼接）
+# 使用第14步的model，把每個變數的勝算比(OR)與信賴區間視覺化呈現，
+# 並在右側加上對應的OR(95%CI)文字表，方便精確讀值
+# 做法說明：
+#   用broom::tidy()把glm模型物件整理成整齊表格（exponentiate=TRUE直接轉成OR，
+#   conf.int=TRUE一併算出95%信賴區間），再拆成左右兩個獨立的ggplot面板，
+#   用patchwork左右拼接——這樣文字表格不會跟圖形共用同一個座標軸，
+#   避免log尺度下OR數值差距過大時，文字欄位中間出現大片不自然的留白
+# （套件broom、ggplot2、patchwork皆已於第0步載入）
+# ==================================================
+forest_data <- tidy(model, exponentiate = TRUE, conf.int = TRUE)
+forest_data <- subset(forest_data, term != "(Intercept)")   # 不畫截距項
+
+print(forest_data$term)   # 先確認實際term名稱，再對照填中文標籤（類別變項會變成"factor(bsXX)數字"的格式）
+
+# ------------------------------------------------
+# 變數代碼 → 中文標籤 對照表
+# factor(bs46a)2：bs46a原始編碼1＝否、2＝是（見第5步），factor()預設以最小值1（否）為參照組，
+#                 故這裡代表「運用定位服務：是」相對於「否」的勝算比
+# ------------------------------------------------
+forest_labels <- data.frame(
+  term = c(
+    "factor(bs46a)2", "bs27", "bs44", "bs55", "bs26", "bs25_mno", "bs22",
+    "bs20_restrict", "bs23", "bs24", "bs56", "bs57_suppression", "bs18",
+    "bs25_abc", "bs8_count", "bs25_ghi", "bs25_jkl", "bs60e"
+  ),
+  中文標籤 = c(
+    "運用定位服務: 是", "FOMO", "上網動機", "情緒與社會技能", "網路社會比較",
+    "網路逃避現實", "網路因應策略", "父母限制型介入", "網路形象管理", "社群認可焦慮",
+    "憂鬱症狀", "情緒表達抑制", "父母未來期望", "網路自我形象認同", "生活壓力事件數",
+    "網路多重身份", "網路與現實自我落差", "睡眠品質"
+  ),
+  stringsAsFactors = FALSE
+)
+forest_data <- merge(forest_data, forest_labels, by = "term", all.x = TRUE)
+
+# 依OR大小排序（兩個面板共用同一個順序，才會上下對得齊）
+forest_data$中文標籤 <- factor(
+  forest_data$中文標籤,
+  levels = forest_data$中文標籤[order(forest_data$estimate)]
+)
+
+# 95%信賴區間是否跨過OR=1（1代表沒有效果），作為顯著與否的視覺標示
+forest_data$顯著 <- ifelse(
+  forest_data$conf.low > 1 | forest_data$conf.high < 1,
+  "顯著", "不顯著"
+)
+
+# OR(95%CI)文字欄位，放進右側文字面板
+forest_data$or_text <- sprintf(
+  "%.2f (%.2f, %.2f)",
+  forest_data$estimate, forest_data$conf.low, forest_data$conf.high
+)
+
+# ------------------------------------------------
+# 左面板：森林圖本體（點 + 誤差線，log尺度呈現OR）
+# ------------------------------------------------
+panel_plot <- ggplot(
+  forest_data,
+  aes(x = estimate, y = 中文標籤, color = 顯著)
+) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey50") +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.2, linewidth = 0.7) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("顯著" = "#D1495B", "不顯著" = "#9CA8C4")) +
+  scale_x_log10(breaks = c(0.5, 1, 2, 4, 8)) +
+  labs(x = "Odds Ratio", y = NULL, color = NULL) +
+  theme_minimal(base_size = 15) +
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position = "bottom"
+  )
+
+# ------------------------------------------------
+# 右面板：純文字表格（OR(95%CI)），y軸順序跟左面板一致，確保每一列對齊
+# ------------------------------------------------
+table_plot <- ggplot(
+  forest_data,
+  aes(y = 中文標籤)
+) +
+  geom_text(aes(x = 0, label = or_text), hjust = 0, size = 4) +
+  xlim(0, 1) +
+  theme_void(base_size = 15) +
+  theme(
+    axis.text.y = element_blank(),
+    plot.margin = margin(t = 10, r = 10, b = 10, l = 0)
+  )
+
+# ------------------------------------------------
+# 拼接：左面板（圖形）較寬，右面板（文字表）較窄
+# ------------------------------------------------
+forest_plot <- panel_plot + table_plot + plot_layout(widths = c(2.5, 1))
+
+print(forest_plot)
+
+ggsave(
+  "forest_plot.png",
+  plot = forest_plot,
+  width = 10,
+  height = max(5, nrow(forest_data) * 0.4),
+  dpi = 300
+)
