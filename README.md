@@ -19,4 +19,4 @@
 
 ## 使用工具
 
-R（dplyr, ggplot2, broom）
+R（dplyr, ggplot2, broom, patchwork）
